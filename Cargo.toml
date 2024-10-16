@@ -1,0 +1,18 @@
+[package]
+name = "rev-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+chrono = "0.4.38"
+clap = { version = "4.5.20", features = ["derive"] }
+clap_derive = "4.0.0-rc.1"
+dotenvy = "0.15.7"
+ethers = "2.0.14"
+lazy_static = "1.5.0"
+num-bigint = "0.4.6"
+reqwest = { version = "0.12.8", features = ["json"] }
+serde = "1.0.210"
+thiserror = "1.0.64"
+tokio = { version = "1.40.0", features = ["full"] }
