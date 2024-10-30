@@ -1,75 +1,113 @@
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 use crate::{
-    config::{BSCSCAN_API_KEY, NETWORK},
+    config::NETWORK,
     constants::ENetwork,
-    errors::RequestError,
-    types::{GetBlockNumberByTimestampResponse, GetTransactionResponse, RequestResult},
+    types::{Coin, GetTransactionResponse, RequestResult, TxDetailData},
 };
 
-use anyhow::Ok;
 use num_bigint::BigInt;
+use regex::Regex;
 use reqwest::Client;
 
-pub async fn get_block_number_by_timestamp(timestamp: u64) -> RequestResult<String> {
-    let network = match *NETWORK {
-        ENetwork::Mainnet => "api",
-        ENetwork::Testnet => "api-testnet",
+async fn get_historical_transactions(
+    address: &String,
+    timestamp: u64,
+) -> RequestResult<Vec<TxDetailData>> {
+    let host = match *NETWORK {
+        ENetwork::Mainnet => "https://sentry.exchange.grpc-web.injective.network",
+        ENetwork::Testnet => "https://testnet.sentry.exchange.grpc-web.injective.network",
     };
-    let url = format!(
-        "https://{}.bscscan.com/api?module=block&action=getblocknobytime&timestamp={}&closest=before&apikey={}",
-        network, timestamp, *BSCSCAN_API_KEY
+    let base_url = format!(
+        "{}/api/explorer/v1/accountTxs/{}?end_time={}",
+        host, address, timestamp
     );
 
     let client = Client::new();
-    let response = client.get(&url).send().await?;
+    let mut offset = 0;
+    let mut transactions: Vec<TxDetailData> = Vec::new();
+    loop {
+        println!("Fetching trx history at offset {}", offset);
 
-    let block_number = response.json::<GetBlockNumberByTimestampResponse>().await?;
+        let url = format!("{}&skip={}", base_url, offset);
+        let response = client.get(&url).send().await?;
+        let trx_response: GetTransactionResponse = response.json().await?;
 
-    if block_number.status != "1" {
-        return Err(RequestError::RequestBlockNumberFailed.into());
+        transactions.extend(trx_response.data.unwrap());
+
+        if trx_response.paging.total - offset < 100 {
+            break;
+        }
+        offset += 100;
     }
 
-    Ok(block_number.result)
+    Ok(transactions)
 }
 
 pub async fn get_historical_balance(
     address: String,
-    block_number: String,
-) -> RequestResult<BigInt> {
-    println!("{}", address);
-    let network = match *NETWORK {
-        ENetwork::Mainnet => "api",
-        ENetwork::Testnet => "api-testnet",
-    };
-    let url = format!(
-        "https://{}.bscscan.com/api?module=account&action=txlist&address={}&startblock=0&endblock={}&sort=asc&apikey={}",
-        network, address.to_owned(), block_number, *BSCSCAN_API_KEY
-    );
+    timestamp: u64,
+) -> RequestResult<HashMap<String, BigInt>> {
+    let transactions = get_historical_transactions(&address, timestamp).await?;
 
-    let client = Client::new();
-    let response = client.get(&url).send().await?;
-    let account_balance = response.json::<GetTransactionResponse>().await?;
+    let mut balances: HashMap<String, BigInt> = HashMap::new();
+    let re = Regex::new(r"^(\d+)(.+)$").unwrap();
 
-    if account_balance.status != "1" {
-        return Err(
-            RequestError::RequestTransactionByAddressFailed(account_balance.message).into(),
-        );
-    }
+    transactions.into_iter().rev().for_each(|trx| {
+        if trx.gas_fee.payer == address {
+            trx.gas_fee.amount.into_iter().for_each(|amount| {
+                let balance = balances.entry(amount.denom).or_insert(BigInt::from(0));
+                *balance -= &BigInt::from_str(&amount.amount).unwrap();
+            });
+        }
 
-    let account_balance = account_balance
-        .result
-        .into_iter()
-        .fold(BigInt::from(0), |acc, trx| {
-            let value = BigInt::from_str(&trx.value).unwrap();
-            let gas_used = BigInt::from_str(&trx.gas_used).unwrap();
-            let gas_price = BigInt::from_str(&trx.gas_price).unwrap();
+        if let Some(logs) = trx.logs {
+            let events: Vec<_> = logs
+                .into_iter()
+                .flat_map(|log| {
+                    log.events.into_iter().filter(|event| {
+                        (event.r#type == "transfer"
+                            && event
+                                .attributes
+                                .iter()
+                                .any(|attribute| attribute.value == address))
+                            || event.r#type == "injective.exchange.v1beta1.EventSubaccountDeposit"
+                    })
+                })
+                .collect();
 
-            if address.eq(&trx.from) {
-                acc - value - gas_used * gas_price
-            } else {
-                acc + value
-            }
-        });
-    Ok(account_balance)
+            events.into_iter().for_each(|event| {
+                let amount_attr = event
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.key == "amount")
+                    .unwrap();
+
+                if event.r#type == "transfer" {
+                    let recipient_attr = event
+                        .attributes
+                        .iter()
+                        .find(|attr| attr.key == "recipient")
+                        .unwrap();
+
+                    let captures = re.captures(&amount_attr.value).unwrap();
+                    let amount = BigInt::from_str(captures.get(1).unwrap().as_str()).unwrap();
+                    let token = captures.get(2).unwrap().as_str().to_string();
+                    let balance = balances.entry(token.clone()).or_insert(BigInt::from(0));
+
+                    if recipient_attr.value == address {
+                        *balance += &amount;
+                    } else {
+                        *balance -= &amount;
+                    }
+                } else {
+                    let coin: Coin = serde_json::from_str(&amount_attr.value).unwrap();
+                    let balance = balances.entry(coin.denom).or_insert(BigInt::from(0));
+                    *balance += &BigInt::from_str(&coin.amount).unwrap();
+                }
+            });
+        }
+    });
+
+    Ok(balances)
 }

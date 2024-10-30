@@ -1,12 +1,10 @@
 pub enum EEnv {
-    BSCScanAPIKey,
     Network,
 }
 
 impl EEnv {
     fn to_str(&self) -> &str {
         match self {
-            Self::BSCScanAPIKey => "BSCSCAN_API_KEY",
             Self::Network => "NETWORK",
         }
     }
